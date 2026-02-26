@@ -116,6 +116,15 @@ fn create_and_checkout(repo: &Repository, remote_branch: &str, new_name: &str) -
 // ──────────────────────────────────────────────
 
 fn main() -> Result<()> {
+    // 处理 -v / --version 参数
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(|s| s.as_str()) == Some("-v")
+        || args.get(1).map(|s| s.as_str()) == Some("--version")
+    {
+        println!("gp {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     // 向上查找 git 仓库
     let repo = Repository::discover(".")
         .context("当前目录不在 git 仓库中，请进入项目目录后重试")?;
