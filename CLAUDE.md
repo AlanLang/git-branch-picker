@@ -38,6 +38,18 @@ cargo build --release          # 产物：target/release/gp
 cargo install --path .         # 安装到 ~/.cargo/bin/gp
 ```
 
+## CI / 自动发布
+
+工作流文件：`.github/workflows/release.yml`，触发条件：push 到 `main`。
+
+流程：
+1. 对比 `HEAD` 与 `HEAD~1` 的 `Cargo.toml` `version` 字段
+2. 版本号变化时，在 `macos-14`（Apple Silicon）上编译 `aarch64-apple-darwin` 二进制
+3. 查找上一版本的 git tag（`v<prev>`），生成两个版本之间的 commit 列表作为 changelog
+4. 创建 GitHub Release（tag `v<version>`），附件为 `gp-aarch64-apple-darwin.tar.gz`
+
+**触发新 Release 的方法**：修改 `Cargo.toml` 中的 `version` 字段，然后提交推送即可。
+
 ## 常见扩展方向
 
 - **支持多个 remote**：在 `list_remote_branches` 中动态枚举所有 remote，而非硬编码 `origin`

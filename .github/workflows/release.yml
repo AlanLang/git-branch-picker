@@ -1,0 +1,90 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  release:
+    runs-on: macos-14  # Apple Silicon 原生运行器
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 获取完整历史以便生成 changelog 和查找 tag
+
+      # ── 检查 Cargo.toml 版本号是否变化 ──────────────────────────
+      - name: Check version change
+        id: version
+        run: |
+          CURRENT=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
+          PREV=$(git show HEAD~1:Cargo.toml 2>/dev/null | grep '^version' | head -1 | cut -d'"' -f2 || echo "")
+
+          echo "current=$CURRENT" >> $GITHUB_OUTPUT
+          echo "prev=$PREV"       >> $GITHUB_OUTPUT
+
+          if [ "$CURRENT" != "$PREV" ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ── 以下步骤仅在版本号变化时执行 ────────────────────────────
+      - name: Install Rust toolchain
+        if: steps.version.outputs.changed == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache cargo registry
+        if: steps.version.outputs.changed == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build (aarch64-apple-darwin)
+        if: steps.version.outputs.changed == 'true'
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Package binary
+        if: steps.version.outputs.changed == 'true'
+        run: |
+          tar -czf gp-aarch64-apple-darwin.tar.gz \
+            -C target/aarch64-apple-darwin/release gp
+
+      # ── 生成两个版本之间的 commit changelog ─────────────────────
+      - name: Generate changelog
+        if: steps.version.outputs.changed == 'true'
+        id: changelog
+        run: |
+          PREV="${{ steps.version.outputs.prev }}"
+
+          # 如果上一个版本的 tag 存在，则只取两版本之间的提交
+          if git rev-parse "v${PREV}" >/dev/null 2>&1; then
+            RANGE="v${PREV}..HEAD"
+          else
+            RANGE="HEAD"
+          fi
+
+          git log $RANGE --pretty=format:"- %s" --no-merges > changelog.txt
+          echo "--- changelog ---"
+          cat changelog.txt
+
+      # ── 创建 GitHub Release 并上传产物 ──────────────────────────
+      - name: Create GitHub Release
+        if: steps.version.outputs.changed == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.current }}
+          name: v${{ steps.version.outputs.current }}
+          body_path: changelog.txt
+          files: gp-aarch64-apple-darwin.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
