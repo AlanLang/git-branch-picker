@@ -66,7 +66,7 @@ gp clean
 ### 查看版本
 
 ```bash
-gp -v
+gp -V
 gp --version
 ```
 
@@ -126,6 +126,7 @@ $ gp clean
 | 库 | 用途 |
 |----|------|
 | `git2` | Git 操作（读取分支、创建分支、worktree、追踪配置） |
+| `clap` | CLI 参数解析与子命令管理（derive 模式） |
 | `inquire` | 交互式 TUI 选择，内置模糊搜索 |
 | `crossterm` | 单键操作模式读取 |
 | `serde` + `serde_json` | 频率数据序列化 |

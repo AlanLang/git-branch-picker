@@ -9,12 +9,13 @@
 ## 架构
 
 ```
-src/main.rs          唯一源文件，所有逻辑在此
-  FrequencyStore     读写 .git/branch-picker-freq.json，记录各分支被选次数
-  BranchItem         包装分支名和频率，实现 Display 供 inquire 展示
-  list_remote_branches()    枚举 origin/* 远端追踪分支
-  create_and_checkout()     创建本地分支 + checkout + 设置追踪关系
-  main()             参数解析 → 列分支 → 排序 → 交互选择 → 创建分支
+src/
+  main.rs       入口：clap 解析 + 调度子命令 + 默认分支选择流程
+  cli.rs        clap Derive 定义（Cli struct + Command enum）
+  git.rs        Git 操作（open_repo, list_remote_branches, create_and_checkout, create_worktree）
+  freq.rs       FrequencyStore（load/save/increment/count）
+  worktree.rs   worktree 管理（clean_worktrees, interactive_worktree_list, gather_worktrees, WorktreeEntry）
+  ui.rs         UI 交互（Action, WtAction, BranchItem, read_action, read_worktree_action, spawn_shell_in, worktree_is_dirty）
 ```
 
 ## 关键约定
@@ -28,7 +29,7 @@ src/main.rs          唯一源文件，所有逻辑在此
 
 - 交互 UI → `inquire`（内置模糊搜索，勿替换为 `dialoguer`）
 - Git 操作 → `git2`（原生绑定，勿调用 `git` 子进程）
-- 参数解析 → 当前手动解析 `std::env::args()`，如需扩展子命令再引入 `clap`
+- 参数解析 → `clap`（derive 模式，子命令定义在 `cli.rs`）
 - 避免引入无必要的依赖
 
 ## 构建与安装
@@ -55,4 +56,4 @@ cargo install --path .         # 安装到 ~/.cargo/bin/gp
 - **支持多个 remote**：在 `list_remote_branches` 中动态枚举所有 remote，而非硬编码 `origin`
 - **自动 fetch**：在列分支前执行 `Remote::fetch()`，需处理认证（SSH / HTTPS）
 - **自定义分支名模板**：通过 CLI 参数覆盖默认的时间戳后缀格式
-- **引入 clap**：当参数超过 2 个时替换当前手动解析逻辑
+- **添加更多子命令**：在 `cli.rs` 的 `Command` enum 中新增变体即可
