@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ──────────────────────────────────────────────
 // 使用频率持久化
@@ -213,16 +213,211 @@ fn create_worktree(
 }
 
 // ──────────────────────────────────────────────
+// gp clean：清理干净的 worktree
+// ──────────────────────────────────────────────
+
+/// 扫描所有 linked worktree，删除满足以下条件的：
+///   1. 工作区干净（无未提交修改，包含 untracked 但排除 ignored）
+///   2. 所有提交均已推送（HEAD 不领先追踪分支）
+fn clean_worktrees(repo: &Repository) -> Result<()> {
+    struct WtInfo {
+        name: String,
+        path: PathBuf,
+    }
+
+    let wt_names = repo.worktrees()?;
+
+    if wt_names.is_empty() {
+        println!("当前仓库没有任何 worktree。");
+        return Ok(());
+    }
+
+    println!("正在检查 {} 个 worktree...\n", wt_names.len());
+
+    let mut to_remove: Vec<WtInfo> = Vec::new();
+    let mut skipped: Vec<(String, &'static str)> = Vec::new();
+
+    for name_opt in wt_names.iter() {
+        let name = match name_opt {
+            Some(n) => n,
+            None => continue,
+        };
+
+        let wt = match repo.find_worktree(name) {
+            Ok(w) => w,
+            Err(_) => {
+                skipped.push((name.to_string(), "无法加载"));
+                continue;
+            }
+        };
+        let wt_path = wt.path().to_path_buf();
+
+        // 以独立 Repository 打开 worktree
+        let wt_repo = match Repository::open(&wt_path) {
+            Ok(r) => r,
+            Err(_) => {
+                skipped.push((name.to_string(), "无法打开仓库"));
+                continue;
+            }
+        };
+
+        // 检查工作区是否干净（含 untracked，排除 ignored）
+        let mut status_opts = git2::StatusOptions::new();
+        status_opts
+            .include_untracked(true)
+            .include_ignored(false)
+            .include_unmodified(false);
+
+        let statuses = match wt_repo.statuses(Some(&mut status_opts)) {
+            Ok(s) => s,
+            Err(_) => {
+                skipped.push((name.to_string(), "无法检查状态"));
+                continue;
+            }
+        };
+
+        if !statuses.is_empty() {
+            skipped.push((name.to_string(), "有未提交的修改"));
+            continue;
+        }
+
+        // 获取 HEAD 所在分支
+        let head = match wt_repo.head() {
+            Ok(h) => h,
+            Err(_) => {
+                skipped.push((name.to_string(), "无 HEAD"));
+                continue;
+            }
+        };
+
+        if !head.is_branch() {
+            skipped.push((name.to_string(), "HEAD 处于游离状态"));
+            continue;
+        }
+
+        let branch_name = head.shorthand().unwrap_or("unknown").to_string();
+        let local_oid = match head.target() {
+            Some(oid) => oid,
+            None => {
+                skipped.push((name.to_string(), "HEAD 无法解析"));
+                continue;
+            }
+        };
+
+        // 获取追踪分支，计算 ahead 数量
+        let branch = match wt_repo.find_branch(&branch_name, BranchType::Local) {
+            Ok(b) => b,
+            Err(_) => {
+                skipped.push((name.to_string(), "找不到本地分支"));
+                continue;
+            }
+        };
+
+        let upstream = match branch.upstream() {
+            Ok(u) => u,
+            Err(_) => {
+                skipped.push((name.to_string(), "无追踪分支"));
+                continue;
+            }
+        };
+
+        let upstream_oid = match upstream.get().target() {
+            Some(oid) => oid,
+            None => {
+                skipped.push((name.to_string(), "追踪分支无法解析"));
+                continue;
+            }
+        };
+
+        let (ahead, _behind) = match wt_repo.graph_ahead_behind(local_oid, upstream_oid) {
+            Ok(r) => r,
+            Err(_) => {
+                skipped.push((name.to_string(), "无法比较分支进度"));
+                continue;
+            }
+        };
+
+        if ahead > 0 {
+            skipped.push((name.to_string(), "有未推送的提交"));
+            continue;
+        }
+
+        to_remove.push(WtInfo {
+            name: name.to_string(),
+            path: wt_path,
+        });
+    }
+
+    // 展示跳过的条目
+    if !skipped.is_empty() {
+        println!("跳过（有改动或未推送提交）：");
+        for (name, reason) in &skipped {
+            println!("  ✗  {:<40} {}", name, reason);
+        }
+        println!();
+    }
+
+    if to_remove.is_empty() {
+        println!("没有可清理的 worktree。");
+        return Ok(());
+    }
+
+    println!("可安全清理的 worktree：");
+    for info in &to_remove {
+        println!("  •  {:<40} {}", info.name, info.path.display());
+    }
+    println!();
+
+    let confirm = match Confirm::new(&format!("确认删除以上 {} 个 worktree？", to_remove.len()))
+        .with_default(false)
+        .prompt()
+    {
+        Ok(v) => v,
+        Err(InquireError::OperationCanceled) | Err(InquireError::OperationInterrupted) => false,
+        Err(e) => return Err(e.into()),
+    };
+
+    if !confirm {
+        println!("已取消。");
+        return Ok(());
+    }
+
+    let mut removed = 0;
+    for info in &to_remove {
+        // 先删目录，再清 git 内部记录（目录消失后 worktree 变为 invalid，prune(None) 即可处理）
+        if let Err(e) = fs::remove_dir_all(&info.path) {
+            eprintln!("✗ 删除目录失败 {}：{}", info.path.display(), e);
+            continue;
+        }
+        match repo.find_worktree(&info.name).and_then(|wt| wt.prune(None)) {
+            Ok(_) => {}
+            Err(e) => eprintln!("  警告：清理 git 记录失败 {}：{}", info.name, e),
+        }
+        println!("✓ {}  ({})", info.name, info.path.display());
+        removed += 1;
+    }
+
+    println!("\n已清理 {} 个 worktree。", removed);
+    Ok(())
+}
+
+// ──────────────────────────────────────────────
 // 入口
 // ──────────────────────────────────────────────
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(|s| s.as_str()) == Some("-v")
-        || args.get(1).map(|s| s.as_str()) == Some("--version")
-    {
-        println!("gp {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
+    match args.get(1).map(|s| s.as_str()) {
+        Some("-v") | Some("--version") => {
+            println!("gp {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some("clean") => {
+            let repo = Repository::discover(".")
+                .context("当前目录不在 git 仓库中，请进入项目目录后重试")?;
+            return clean_worktrees(&repo);
+        }
+        _ => {}
     }
 
     let repo = Repository::discover(".")
