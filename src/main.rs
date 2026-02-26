@@ -489,6 +489,42 @@ fn gather_worktrees(repo: &Repository) -> Result<Vec<WorktreeEntry>> {
     Ok(entries)
 }
 
+enum WtAction {
+    Cd,
+    Delete,
+    Back,
+    Cancel,
+}
+
+fn read_worktree_action(is_main: bool) -> Result<WtAction> {
+    if is_main {
+        print!("  [↵] 切换  ·  [Esc] 返回：");
+    } else {
+        print!("  [↵] 切换  ·  [d] 删除  ·  [Esc] 返回：");
+    }
+    io::stdout().flush()?;
+
+    enable_raw_mode()?;
+    let result = (|| -> Result<WtAction> {
+        loop {
+            if let Event::Key(key) = event::read()? {
+                match (key.code, key.modifiers) {
+                    (KeyCode::Enter, _) => return Ok(WtAction::Cd),
+                    (KeyCode::Char('d'), _) if !is_main => return Ok(WtAction::Delete),
+                    (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => return Ok(WtAction::Back),
+                    (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
+                        return Ok(WtAction::Cancel);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    })();
+    let _ = disable_raw_mode();
+    println!();
+    result
+}
+
 fn interactive_worktree_list(repo: &Repository) -> Result<()> {
     let mut entries = gather_worktrees(repo)?;
 
@@ -509,39 +545,19 @@ fn interactive_worktree_list(repo: &Repository) -> Result<()> {
             Err(e) => return Err(e.into()),
         };
 
-        let path = selected.path.clone();
-
-        // 主 worktree 只能切换，不能删除
-        if selected.is_main {
-            spawn_shell_in(&path)?;
-            return Ok(());
-        }
-
-        // linked worktree：选择操作
-        let actions = vec!["切换（cd）", "删除", "返回列表"];
-        let action = match Select::new(
-            &format!("对 '{}' 执行什么操作？", selected.branch),
-            actions,
-        )
-        .prompt()
-        {
-            Ok(a) => a,
-            Err(InquireError::OperationCanceled) | Err(InquireError::OperationInterrupted) => {
-                return Ok(());
-            }
-            Err(e) => return Err(e.into()),
-        };
+        // 单键选择操作
+        let action = read_worktree_action(selected.is_main)?;
 
         match action {
-            "切换（cd）" => {
-                spawn_shell_in(&path)?;
+            WtAction::Cd => {
+                spawn_shell_in(&selected.path)?;
                 return Ok(());
             }
-            "删除" => {
-                let wt_name = selected.name.clone();
-                let wt_path = selected.path.clone();
+            WtAction::Delete => {
+                let wt_name = &selected.name;
+                let wt_path = &selected.path;
 
-                let dirty = match Repository::open(&wt_path) {
+                let dirty = match Repository::open(wt_path) {
                     Ok(r) => worktree_is_dirty(&r),
                     Err(_) => true,
                 };
@@ -560,10 +576,10 @@ fn interactive_worktree_list(repo: &Repository) -> Result<()> {
                 };
 
                 if confirm {
-                    if let Err(e) = fs::remove_dir_all(&wt_path) {
+                    if let Err(e) = fs::remove_dir_all(wt_path) {
                         eprintln!("✗ 删除目录失败 {}：{}", wt_path.display(), e);
                     } else {
-                        match repo.find_worktree(&wt_name).and_then(|wt| wt.prune(None)) {
+                        match repo.find_worktree(wt_name).and_then(|wt| wt.prune(None)) {
                             Ok(_) => {}
                             Err(e) => {
                                 eprintln!("  警告：清理 git 记录失败 {}：{}", wt_name, e)
@@ -580,10 +596,11 @@ fn interactive_worktree_list(repo: &Repository) -> Result<()> {
                     return Ok(());
                 }
             }
-            // "返回列表" 或其他
-            _ => {
-                // 刷新列表继续循环
+            WtAction::Back => {
                 entries = gather_worktrees(repo)?;
+            }
+            WtAction::Cancel => {
+                return Ok(());
             }
         }
     }
