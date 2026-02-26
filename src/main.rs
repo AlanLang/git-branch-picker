@@ -1,10 +1,8 @@
 use anyhow::{Context, Result};
 use chrono::Local;
 use crossterm::{
-    cursor,
     event::{self, Event, KeyCode, KeyModifiers},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
+    terminal::{disable_raw_mode, enable_raw_mode},
 };
 use git2::{BranchType, Repository};
 use inquire::{Confirm, InquireError, Select};
@@ -436,6 +434,12 @@ struct WorktreeEntry {
     is_main: bool,
 }
 
+impl fmt::Display for WorktreeEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:<30} {}", self.branch, self.path.display())
+    }
+}
+
 fn gather_worktrees(repo: &Repository) -> Result<Vec<WorktreeEntry>> {
     let mut entries = Vec::new();
 
@@ -485,56 +489,6 @@ fn gather_worktrees(repo: &Repository) -> Result<Vec<WorktreeEntry>> {
     Ok(entries)
 }
 
-fn render_worktree_list(
-    stdout: &mut io::Stdout,
-    entries: &[WorktreeEntry],
-    selected: usize,
-) -> Result<()> {
-    // 计算列宽
-    let max_branch = entries.iter().map(|e| e.branch.len()).max().unwrap_or(10);
-    let col_branch = max_branch.max(6);
-
-    execute!(stdout, cursor::MoveToColumn(0))?;
-
-    for (i, entry) in entries.iter().enumerate() {
-        let marker = if i == selected { ">" } else { " " };
-        let line = format!(
-            "{} {:<width$}   {}",
-            marker,
-            entry.branch,
-            entry.path.display(),
-            width = col_branch
-        );
-        if i == selected {
-            // 高亮：用反色
-            execute!(
-                stdout,
-                crossterm::style::SetAttribute(crossterm::style::Attribute::Reverse)
-            )?;
-            write!(stdout, "{}", line)?;
-            execute!(
-                stdout,
-                crossterm::style::SetAttribute(crossterm::style::Attribute::Reset)
-            )?;
-        } else {
-            write!(stdout, "{}", line)?;
-        }
-        // 清除行剩余部分并换行
-        execute!(stdout, Clear(ClearType::UntilNewLine))?;
-        writeln!(stdout)?;
-    }
-
-    // 帮助行
-    writeln!(stdout)?;
-    write!(
-        stdout,
-        "  ↑/↓/j/k 移动 · Enter 切换 · d 删除 · q/Esc 退出"
-    )?;
-    execute!(stdout, Clear(ClearType::UntilNewLine))?;
-
-    Ok(())
-}
-
 fn interactive_worktree_list(repo: &Repository) -> Result<()> {
     let mut entries = gather_worktrees(repo)?;
 
@@ -543,148 +497,96 @@ fn interactive_worktree_list(repo: &Repository) -> Result<()> {
         return Ok(());
     }
 
-    let mut selected: usize = 0;
-    let mut stdout = io::stdout();
+    loop {
+        let selected = match Select::new("选择 worktree：", entries)
+            .with_help_message("↑↓ 移动 · Enter 选择 · Esc 退出")
+            .prompt()
+        {
+            Ok(item) => item,
+            Err(InquireError::OperationCanceled) | Err(InquireError::OperationInterrupted) => {
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        };
 
-    // 初始渲染
-    println!("Worktrees:\n");
-    render_worktree_list(&mut stdout, &entries, selected)?;
-    stdout.flush()?;
+        let path = selected.path.clone();
 
-    enable_raw_mode()?;
+        // 主 worktree 只能切换，不能删除
+        if selected.is_main {
+            spawn_shell_in(&path)?;
+            return Ok(());
+        }
 
-    let result = (|| -> Result<()> {
-        loop {
-            let total_lines = entries.len() as u16 + 2; // entries + blank + help
-            if let Event::Key(key) = event::read()? {
-                match (key.code, key.modifiers) {
-                    (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => {
-                        // 移到列表底部后退出
-                        execute!(stdout, cursor::MoveDown(0))?;
-                        writeln!(stdout)?;
-                        return Ok(());
-                    }
-                    (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
-                        writeln!(stdout)?;
-                        return Ok(());
-                    }
-                    (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
-                        if selected > 0 {
-                            selected -= 1;
-                        }
-                    }
-                    (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
-                        if selected + 1 < entries.len() {
-                            selected = selected + 1;
-                        }
-                    }
-                    (KeyCode::Enter, _) => {
-                        let entry = &entries[selected];
-                        let path = entry.path.clone();
+        // linked worktree：选择操作
+        let actions = vec!["切换（cd）", "删除", "返回列表"];
+        let action = match Select::new(
+            &format!("对 '{}' 执行什么操作？", selected.branch),
+            actions,
+        )
+        .prompt()
+        {
+            Ok(a) => a,
+            Err(InquireError::OperationCanceled) | Err(InquireError::OperationInterrupted) => {
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        };
 
-                        // 回到列表顶部并清理
-                        execute!(
-                            stdout,
-                            cursor::MoveUp(total_lines),
-                            Clear(ClearType::FromCursorDown)
-                        )?;
-                        disable_raw_mode()?;
+        match action {
+            "切换（cd）" => {
+                spawn_shell_in(&path)?;
+                return Ok(());
+            }
+            "删除" => {
+                let wt_name = selected.name.clone();
+                let wt_path = selected.path.clone();
 
-                        println!("✓ 切换到 worktree：{}", entry.branch);
-                        spawn_shell_in(&path)?;
-                        return Ok(());
-                    }
-                    (KeyCode::Char('d'), _) => {
-                        let entry = &entries[selected];
-                        if entry.is_main {
-                            // 不能删除主 worktree，忽略
-                            continue;
-                        }
+                let dirty = match Repository::open(&wt_path) {
+                    Ok(r) => worktree_is_dirty(&r),
+                    Err(_) => true,
+                };
 
-                        let wt_name = entry.name.clone();
-                        let wt_path = entry.path.clone();
+                let prompt = if dirty {
+                    format!("⚠ worktree '{}' 有未提交修改，确认删除？", wt_name)
+                } else {
+                    format!("确认删除 worktree '{}'？", wt_name)
+                };
 
-                        // 退出 raw mode 进行确认交互
-                        execute!(
-                            stdout,
-                            cursor::MoveUp(total_lines),
-                            Clear(ClearType::FromCursorDown)
-                        )?;
-                        disable_raw_mode()?;
+                let confirm = match Confirm::new(&prompt).with_default(false).prompt() {
+                    Ok(v) => v,
+                    Err(InquireError::OperationCanceled)
+                    | Err(InquireError::OperationInterrupted) => false,
+                    Err(e) => return Err(e.into()),
+                };
 
-                        let dirty = match Repository::open(&wt_path) {
-                            Ok(r) => worktree_is_dirty(&r),
-                            Err(_) => true,
-                        };
-
-                        let prompt = if dirty {
-                            format!(
-                                "⚠ worktree '{}' 有未提交修改，确认删除？",
-                                wt_name
-                            )
-                        } else {
-                            format!("确认删除 worktree '{}'？", wt_name)
-                        };
-
-                        let confirm =
-                            match Confirm::new(&prompt).with_default(false).prompt() {
-                                Ok(v) => v,
-                                Err(InquireError::OperationCanceled)
-                                | Err(InquireError::OperationInterrupted) => false,
-                                Err(e) => return Err(e.into()),
-                            };
-
-                        if confirm {
-                            if let Err(e) = fs::remove_dir_all(&wt_path) {
-                                eprintln!("✗ 删除目录失败 {}：{}", wt_path.display(), e);
-                            } else {
-                                match repo
-                                    .find_worktree(&wt_name)
-                                    .and_then(|wt| wt.prune(None))
-                                {
-                                    Ok(_) => {}
-                                    Err(e) => {
-                                        eprintln!(
-                                            "  警告：清理 git 记录失败 {}：{}",
-                                            wt_name, e
-                                        );
-                                    }
-                                }
-                                println!("✓ 已删除 worktree '{}'", wt_name);
+                if confirm {
+                    if let Err(e) = fs::remove_dir_all(&wt_path) {
+                        eprintln!("✗ 删除目录失败 {}：{}", wt_path.display(), e);
+                    } else {
+                        match repo.find_worktree(&wt_name).and_then(|wt| wt.prune(None)) {
+                            Ok(_) => {}
+                            Err(e) => {
+                                eprintln!("  警告：清理 git 记录失败 {}：{}", wt_name, e)
                             }
-                        } else {
-                            println!("已取消。");
                         }
-
-                        // 刷新列表
-                        entries = gather_worktrees(repo)?;
-                        if entries.is_empty() {
-                            println!("没有剩余的 worktree。");
-                            return Ok(());
-                        }
-                        if selected >= entries.len() {
-                            selected = entries.len() - 1;
-                        }
-
-                        // 重新渲染
-                        println!("\nWorktrees:\n");
-                        render_worktree_list(&mut stdout, &entries, selected)?;
-                        stdout.flush()?;
-                        enable_raw_mode()?;
+                        println!("✓ 已删除 worktree '{}'", wt_name);
                     }
-                    _ => {}
                 }
 
-                // 重绘列表（移到列表起始位置覆盖）
-                execute!(stdout, cursor::MoveUp(total_lines))?;
-                render_worktree_list(&mut stdout, &entries, selected)?;
-                stdout.flush()?;
+                // 刷新列表继续循环
+                entries = gather_worktrees(repo)?;
+                if entries.is_empty() {
+                    println!("没有剩余的 worktree。");
+                    return Ok(());
+                }
+            }
+            // "返回列表" 或其他
+            _ => {
+                // 刷新列表继续循环
+                entries = gather_worktrees(repo)?;
             }
         }
-    })();
-
-    let _ = disable_raw_mode();
-    result
+    }
 }
 
 // ──────────────────────────────────────────────
