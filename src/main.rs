@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use chrono::Local;
 use crossterm::{
+    cursor,
     event::{self, Event, KeyCode, KeyModifiers},
-    terminal::{disable_raw_mode, enable_raw_mode},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
 };
 use git2::{BranchType, Repository};
 use inquire::{Confirm, InquireError, Select};
@@ -12,6 +14,40 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+
+// ──────────────────────────────────────────────
+// 通用辅助函数
+// ──────────────────────────────────────────────
+
+fn open_repo() -> Result<Repository> {
+    Repository::discover(".").context("当前目录不在 git 仓库中，请进入项目目录后重试")
+}
+
+/// 检查 worktree 是否有未提交修改（含 untracked，排除 ignored）
+fn worktree_is_dirty(wt_repo: &Repository) -> bool {
+    let mut status_opts = git2::StatusOptions::new();
+    status_opts
+        .include_untracked(true)
+        .include_ignored(false)
+        .include_unmodified(false);
+
+    match wt_repo.statuses(Some(&mut status_opts)) {
+        Ok(s) => !s.is_empty(),
+        Err(_) => true, // 无法检查时保守认为 dirty
+    }
+}
+
+/// 在指定路径下启动子 Shell
+fn spawn_shell_in(path: &Path) -> Result<()> {
+    println!("\n进入 {} ...", path.display());
+    println!("（子 Shell 中，输入 exit 可返回原目录）\n");
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
+    std::process::Command::new(&shell)
+        .current_dir(path)
+        .status()
+        .context("启动 Shell 失败")?;
+    Ok(())
+}
 
 // ──────────────────────────────────────────────
 // 使用频率持久化
@@ -85,8 +121,7 @@ fn read_action() -> Result<Action> {
                 match (key.code, key.modifiers) {
                     // Enter（无修饰键或仅 Shift）→ 创建分支
                     (KeyCode::Enter, m)
-                        if !m.contains(KeyModifiers::CONTROL)
-                            && !m.contains(KeyModifiers::ALT) =>
+                        if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
                     {
                         return Ok(Action::CreateBranch);
                     }
@@ -139,13 +174,14 @@ fn list_remote_branches(repo: &Repository) -> Result<Vec<String>> {
 
 fn create_and_checkout(repo: &Repository, remote_branch: &str, new_name: &str) -> Result<()> {
     let remote_ref = format!("refs/remotes/origin/{}", remote_branch);
-    let reference = repo
-        .find_reference(&remote_ref)
-        .with_context(|| format!("找不到远端分支 'origin/{}'，请先执行 git fetch", remote_branch))?;
+    let reference = repo.find_reference(&remote_ref).with_context(|| {
+        format!(
+            "找不到远端分支 'origin/{}'，请先执行 git fetch",
+            remote_branch
+        )
+    })?;
 
-    let commit = reference
-        .peel_to_commit()
-        .context("无法解析提交对象")?;
+    let commit = reference.peel_to_commit().context("无法解析提交对象")?;
 
     let branch = repo
         .branch(new_name, &commit, false)
@@ -179,7 +215,10 @@ fn create_worktree(
     let commit_oid = repo
         .find_reference(&remote_ref)
         .with_context(|| {
-            format!("找不到远端分支 'origin/{}'，请先执行 git fetch", remote_branch)
+            format!(
+                "找不到远端分支 'origin/{}'，请先执行 git fetch",
+                remote_branch
+            )
         })?
         .peel_to_commit()
         .context("无法解析提交对象")?
@@ -261,22 +300,7 @@ fn clean_worktrees(repo: &Repository) -> Result<()> {
             }
         };
 
-        // 检查工作区是否干净（含 untracked，排除 ignored）
-        let mut status_opts = git2::StatusOptions::new();
-        status_opts
-            .include_untracked(true)
-            .include_ignored(false)
-            .include_unmodified(false);
-
-        let statuses = match wt_repo.statuses(Some(&mut status_opts)) {
-            Ok(s) => s,
-            Err(_) => {
-                skipped.push((name.to_string(), "无法检查状态"));
-                continue;
-            }
-        };
-
-        if !statuses.is_empty() {
+        if worktree_is_dirty(&wt_repo) {
             skipped.push((name.to_string(), "有未提交的修改"));
             continue;
         }
@@ -402,6 +426,285 @@ fn clean_worktrees(repo: &Repository) -> Result<()> {
 }
 
 // ──────────────────────────────────────────────
+// gp w：交互式 worktree 列表
+// ──────────────────────────────────────────────
+
+struct WorktreeEntry {
+    name: String,
+    branch: String,
+    path: PathBuf,
+    is_main: bool,
+}
+
+fn gather_worktrees(repo: &Repository) -> Result<Vec<WorktreeEntry>> {
+    let mut entries = Vec::new();
+
+    // 主 worktree
+    if let Some(workdir) = repo.workdir() {
+        let branch = repo
+            .head()
+            .ok()
+            .and_then(|h| h.shorthand().map(|s| s.to_string()))
+            .unwrap_or_else(|| "(detached)".to_string());
+        entries.push(WorktreeEntry {
+            name: "(main)".to_string(),
+            branch,
+            path: workdir.to_path_buf(),
+            is_main: true,
+        });
+    }
+
+    // linked worktrees
+    let wt_names = repo.worktrees()?;
+    for name_opt in wt_names.iter() {
+        let name = match name_opt {
+            Some(n) => n,
+            None => continue,
+        };
+        let wt = match repo.find_worktree(name) {
+            Ok(w) => w,
+            Err(_) => continue,
+        };
+        let wt_path = wt.path().to_path_buf();
+        let branch = match Repository::open(&wt_path) {
+            Ok(r) => r
+                .head()
+                .ok()
+                .and_then(|h| h.shorthand().map(|s| s.to_string()))
+                .unwrap_or_else(|| "(detached)".to_string()),
+            Err(_) => "(unknown)".to_string(),
+        };
+        entries.push(WorktreeEntry {
+            name: name.to_string(),
+            branch,
+            path: wt_path,
+            is_main: false,
+        });
+    }
+
+    Ok(entries)
+}
+
+fn render_worktree_list(
+    stdout: &mut io::Stdout,
+    entries: &[WorktreeEntry],
+    selected: usize,
+) -> Result<()> {
+    // 计算列宽
+    let max_branch = entries.iter().map(|e| e.branch.len()).max().unwrap_or(10);
+    let col_branch = max_branch.max(6);
+
+    execute!(stdout, cursor::MoveToColumn(0))?;
+
+    for (i, entry) in entries.iter().enumerate() {
+        let marker = if i == selected { ">" } else { " " };
+        let line = format!(
+            "{} {:<width$}   {}",
+            marker,
+            entry.branch,
+            entry.path.display(),
+            width = col_branch
+        );
+        if i == selected {
+            // 高亮：用反色
+            execute!(
+                stdout,
+                crossterm::style::SetAttribute(crossterm::style::Attribute::Reverse)
+            )?;
+            write!(stdout, "{}", line)?;
+            execute!(
+                stdout,
+                crossterm::style::SetAttribute(crossterm::style::Attribute::Reset)
+            )?;
+        } else {
+            write!(stdout, "{}", line)?;
+        }
+        // 清除行剩余部分并换行
+        execute!(stdout, Clear(ClearType::UntilNewLine))?;
+        writeln!(stdout)?;
+    }
+
+    // 帮助行
+    writeln!(stdout)?;
+    write!(
+        stdout,
+        "  ↑/↓/j/k 移动 · Enter 切换 · d 删除 · q/Esc 退出"
+    )?;
+    execute!(stdout, Clear(ClearType::UntilNewLine))?;
+
+    Ok(())
+}
+
+fn interactive_worktree_list(repo: &Repository) -> Result<()> {
+    let mut entries = gather_worktrees(repo)?;
+
+    if entries.is_empty() {
+        println!("当前仓库没有任何 worktree。");
+        return Ok(());
+    }
+
+    let mut selected: usize = 0;
+    let mut stdout = io::stdout();
+
+    // 初始渲染
+    println!("Worktrees:\n");
+    render_worktree_list(&mut stdout, &entries, selected)?;
+    stdout.flush()?;
+
+    enable_raw_mode()?;
+
+    let result = (|| -> Result<()> {
+        loop {
+            let total_lines = entries.len() as u16 + 2; // entries + blank + help
+            if let Event::Key(key) = event::read()? {
+                match (key.code, key.modifiers) {
+                    (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => {
+                        // 移到列表底部后退出
+                        execute!(stdout, cursor::MoveDown(0))?;
+                        writeln!(stdout)?;
+                        return Ok(());
+                    }
+                    (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
+                        writeln!(stdout)?;
+                        return Ok(());
+                    }
+                    (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+                        if selected > 0 {
+                            selected -= 1;
+                        }
+                    }
+                    (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+                        if selected + 1 < entries.len() {
+                            selected = selected + 1;
+                        }
+                    }
+                    (KeyCode::Enter, _) => {
+                        let entry = &entries[selected];
+                        let path = entry.path.clone();
+
+                        // 回到列表顶部并清理
+                        execute!(
+                            stdout,
+                            cursor::MoveUp(total_lines),
+                            Clear(ClearType::FromCursorDown)
+                        )?;
+                        disable_raw_mode()?;
+
+                        println!("✓ 切换到 worktree：{}", entry.branch);
+                        spawn_shell_in(&path)?;
+                        return Ok(());
+                    }
+                    (KeyCode::Char('d'), _) => {
+                        let entry = &entries[selected];
+                        if entry.is_main {
+                            // 不能删除主 worktree，忽略
+                            continue;
+                        }
+
+                        let wt_name = entry.name.clone();
+                        let wt_path = entry.path.clone();
+
+                        // 退出 raw mode 进行确认交互
+                        execute!(
+                            stdout,
+                            cursor::MoveUp(total_lines),
+                            Clear(ClearType::FromCursorDown)
+                        )?;
+                        disable_raw_mode()?;
+
+                        let dirty = match Repository::open(&wt_path) {
+                            Ok(r) => worktree_is_dirty(&r),
+                            Err(_) => true,
+                        };
+
+                        let prompt = if dirty {
+                            format!(
+                                "⚠ worktree '{}' 有未提交修改，确认删除？",
+                                wt_name
+                            )
+                        } else {
+                            format!("确认删除 worktree '{}'？", wt_name)
+                        };
+
+                        let confirm =
+                            match Confirm::new(&prompt).with_default(false).prompt() {
+                                Ok(v) => v,
+                                Err(InquireError::OperationCanceled)
+                                | Err(InquireError::OperationInterrupted) => false,
+                                Err(e) => return Err(e.into()),
+                            };
+
+                        if confirm {
+                            if let Err(e) = fs::remove_dir_all(&wt_path) {
+                                eprintln!("✗ 删除目录失败 {}：{}", wt_path.display(), e);
+                            } else {
+                                match repo
+                                    .find_worktree(&wt_name)
+                                    .and_then(|wt| wt.prune(None))
+                                {
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        eprintln!(
+                                            "  警告：清理 git 记录失败 {}：{}",
+                                            wt_name, e
+                                        );
+                                    }
+                                }
+                                println!("✓ 已删除 worktree '{}'", wt_name);
+                            }
+                        } else {
+                            println!("已取消。");
+                        }
+
+                        // 刷新列表
+                        entries = gather_worktrees(repo)?;
+                        if entries.is_empty() {
+                            println!("没有剩余的 worktree。");
+                            return Ok(());
+                        }
+                        if selected >= entries.len() {
+                            selected = entries.len() - 1;
+                        }
+
+                        // 重新渲染
+                        println!("\nWorktrees:\n");
+                        render_worktree_list(&mut stdout, &entries, selected)?;
+                        stdout.flush()?;
+                        enable_raw_mode()?;
+                    }
+                    _ => {}
+                }
+
+                // 重绘列表（移到列表起始位置覆盖）
+                execute!(stdout, cursor::MoveUp(total_lines))?;
+                render_worktree_list(&mut stdout, &entries, selected)?;
+                stdout.flush()?;
+            }
+        }
+    })();
+
+    let _ = disable_raw_mode();
+    result
+}
+
+// ──────────────────────────────────────────────
+// 帮助信息
+// ──────────────────────────────────────────────
+
+fn print_help() {
+    println!(
+        "gp — 交互式 Git 分支创建工具
+
+用法：
+  gp              选择远端分支，创建本地工作分支或 worktree
+  gp w            列出所有 worktree，支持切换和删除
+  gp clean        清理干净的 worktree（无修改、无未推送提交）
+  gp -v           显示版本号
+  gp -h, --help   显示此帮助信息"
+    );
+}
+
+// ──────────────────────────────────────────────
 // 入口
 // ──────────────────────────────────────────────
 
@@ -412,16 +715,22 @@ fn main() -> Result<()> {
             println!("gp {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
+        Some("-h") | Some("--help") => {
+            print_help();
+            return Ok(());
+        }
         Some("clean") => {
-            let repo = Repository::discover(".")
-                .context("当前目录不在 git 仓库中，请进入项目目录后重试")?;
+            let repo = open_repo()?;
             return clean_worktrees(&repo);
+        }
+        Some("w") => {
+            let repo = open_repo()?;
+            return interactive_worktree_list(&repo);
         }
         _ => {}
     }
 
-    let repo = Repository::discover(".")
-        .context("当前目录不在 git 仓库中，请进入项目目录后重试")?;
+    let repo = open_repo()?;
 
     let freq_path = repo.path().join("branch-picker-freq.json");
     let mut freq = FrequencyStore::load(&freq_path);
@@ -512,19 +821,14 @@ fn main() -> Result<()> {
                 .prompt()
             {
                 Ok(v) => v,
-                Err(InquireError::OperationCanceled)
-                | Err(InquireError::OperationInterrupted) => false,
+                Err(InquireError::OperationCanceled) | Err(InquireError::OperationInterrupted) => {
+                    false
+                }
                 Err(e) => return Err(e.into()),
             };
 
             if should_cd {
-                println!("\n进入 {} ...", worktree_path.display());
-                println!("（子 Shell 中，输入 exit 可返回原目录）\n");
-                let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
-                std::process::Command::new(&shell)
-                    .current_dir(&worktree_path)
-                    .status()
-                    .context("启动 Shell 失败")?;
+                spawn_shell_in(&worktree_path)?;
             }
         }
     }
