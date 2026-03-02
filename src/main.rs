@@ -99,8 +99,7 @@ fn main() -> Result<()> {
             let default_name = format!("{}-{}", branch_name, timestamp);
 
             let new_branch = match Text::new("Worktree 名称：")
-                .with_default(&default_name)
-                .with_help_message("回车使用默认名称，或输入自定义名称")
+                .with_initial_value(&default_name)
                 .prompt()
             {
                 Ok(name) => {
