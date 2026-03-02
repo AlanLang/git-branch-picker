@@ -7,7 +7,7 @@ mod worktree;
 use anyhow::{Context, Result};
 use chrono::Local;
 use clap::Parser;
-use inquire::{Confirm, InquireError, Select};
+use inquire::{Confirm, InquireError, Select, Text};
 
 use cli::{Cli, Command};
 use freq::FrequencyStore;
@@ -96,7 +96,27 @@ fn main() -> Result<()> {
             freq.save(&freq_path)?;
 
             let timestamp = Local::now().format("%Y%m%d%H%M%S");
-            let new_branch = format!("{}-{}", branch_name, timestamp);
+            let default_name = format!("{}-{}", branch_name, timestamp);
+
+            let new_branch = match Text::new("Worktree 名称：")
+                .with_default(&default_name)
+                .with_help_message("回车使用默认名称，或输入自定义名称")
+                .prompt()
+            {
+                Ok(name) => {
+                    let name = name.trim().to_string();
+                    if name.is_empty() {
+                        default_name
+                    } else {
+                        name
+                    }
+                }
+                Err(InquireError::OperationCanceled) | Err(InquireError::OperationInterrupted) => {
+                    println!("已取消。");
+                    return Ok(());
+                }
+                Err(e) => return Err(e.into()),
+            };
 
             let repo_root = repo
                 .workdir()
